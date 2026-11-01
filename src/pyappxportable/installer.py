@@ -2,11 +2,13 @@
 
 import os
 import platform
+import shutil
 import sys
 import tempfile
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
+from pyappxportable.components import install_component_projections
 from pyappxportable.dependencies import (
     VCLIBS_DOWNLOADS,
     add_native_frameworks,
@@ -25,7 +27,11 @@ from pyappxportable.launchers import (
     plays_media,
     write_launcher,
 )
-from pyappxportable.macos import add_macos_dependencies, install_managed_wine
+from pyappxportable.macos import (
+    WINE_DEVEL_APP,
+    add_macos_dependencies,
+    install_managed_wine,
+)
 from pyappxportable.manifest import Manifest
 from pyappxportable.options import InstallOptions
 from pyappxportable.patches import KNOWN_PATCHES, apply_known_patch
@@ -166,7 +172,7 @@ def choose_store(args, ask: Callable[[str], str], game: Path) -> Optional[str]:
             return STORE_ANSWERS.get(answer)
 
 
-def install_game(  # pylint: disable=too-many-locals
+def install_game(  # pylint: disable=too-many-locals,too-many-branches
     args: InstallOptions, ask: Callable[[str], str] = input
 ) -> int:
     """Install the game the arguments and answers describe."""
@@ -208,6 +214,18 @@ def install_game(  # pylint: disable=too-many-locals
         and tag
     ):
         managed_wine = install_managed_wine(tag)
+    if sys.platform == "darwin":
+        add_macos_dependencies(args, ask, wine_ready=managed_wine is not None)
+    if managed and sys.platform != "win32":
+        selected_wine = os.environ.get("WINE") or managed_wine or shutil.which("wine")
+        if selected_wine is None and sys.platform == "darwin":
+            selected_wine = WINE_DEVEL_APP / "Contents/Resources/wine/bin/wine"
+        install_component_projections(
+            destination,
+            Path(selected_wine) if selected_wine else None,
+            tag=tag,
+            build=absolute(args.build) if args.build else None,
+        )
     launcher = args.launcher
     if launcher is None:
         answer = "" if args.yes else ask(f"Create the {LAUNCHER} launcher? [Y/n]: ")
@@ -223,8 +241,6 @@ def install_game(  # pylint: disable=too-many-locals
                 wine_runtime=managed_wine,
             )
         )
-    if sys.platform == "darwin":
-        add_macos_dependencies(args, ask, wine_ready=managed_wine is not None)
     if managed and sys.platform != "win32":
         message = (
             "managed (.NET) games still need the WinRT projection and XAML engine;"

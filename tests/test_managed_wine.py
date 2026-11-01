@@ -230,6 +230,7 @@ class ManagedWineInstallTests(unittest.TestCase):
         manifest = Manifest("Game", "1.0.0.0", architecture, "Game.exe", [])
         stubs = {
             "choose_folders": mock.DEFAULT,
+            "install_component_projections": mock.DEFAULT,
             "add_missing_vclibs": mock.DEFAULT,
             "add_native_frameworks": mock.DEFAULT,
             "write_settings": mock.DEFAULT,
@@ -268,6 +269,7 @@ class ManagedWineInstallTests(unittest.TestCase):
             patched["plays_media"].return_value = False
             patched["path_warning"].return_value = None
             patched["read_store"].return_value = "none"
+            self.projections = patched["install_component_projections"]
             code = installer.install_game(InstallOptions(no_patch=True, store="0"))
         return code, runtime, patched["add_macos_dependencies"], output.getvalue()
 
@@ -275,6 +277,9 @@ class ManagedWineInstallTests(unittest.TestCase):
         code, runtime, dependencies, output = self.install()
         self.assertEqual(code, 0)
         runtime.assert_called_once_with("v-test")
+        self.projections.assert_called_once_with(
+            self.game, self.selected, tag="v-test", build=None
+        )
         text = (self.game / "00_click2startme.command").read_text()
         self.assertIn(str(self.selected), text)
         self.assertIn(".wine-prefix", text)
@@ -285,6 +290,7 @@ class ManagedWineInstallTests(unittest.TestCase):
         code, runtime, dependencies, output = self.install(managed=False)
         self.assertEqual(code, 0)
         runtime.assert_not_called()
+        self.projections.assert_not_called()
         self.assertFalse(dependencies.call_args.kwargs.get("wine_ready", False))
         self.assertNotIn("fixes CLR startup only", output)
 

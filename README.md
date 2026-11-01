@@ -66,6 +66,21 @@ managed games still need WinRT projection and XAML support.
 
 On macOS, the installer can set up Wine Devel, Rosetta 2, and GStreamer. Rosetta and GStreamer require administrator authorization; `--yes` prints instructions for those steps. See the [installer guide](https://github.com/yell0wsuit/appx-portable/blob/main/docs/installer.md) and [game compatibility](https://github.com/yell0wsuit/appx-portable/blob/main/docs/compatibility.md).
 
+Managed Wine installs also discover native WinRT components registered in the
+package manifest and generate their managed projections at install time. Runtime
+releases must include `appx-portable-winrt-tools.zip`; with `--build`, place that
+ZIP in the build folder (create it with Appx Portable's
+`scripts/package-winrt-tools.py --output BUILD/appx-portable-winrt-tools.zip`).
+The selected Wine installation must provide one Wine Mono compiler, .NET 4.8
+reference set, and Mono.Cecil 0.11. Generated assemblies live in
+`appx-projections/`; the original native component DLLs remain in place.
+
+This currently supports default activation, scalar/string methods, input byte
+arrays and custom callbacks. Unsupported signatures, including external Windows
+types, fail with a named diagnostic. Windows installations keep the CLR's native
+WinRT projection path. Neither SDK metadata nor compiler/Cecil tools are copied
+to the game directory.
+
 ## Python API
 
 ```python
