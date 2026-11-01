@@ -21,6 +21,7 @@ from pyappxportable.pe import pe_info
 from pyappxportable.runtime import replace_file
 
 TOOLS_ASSET = "appx-portable-winrt-tools.zip"
+INTEROP_ASSEMBLY = "AppxPortable.WinRT.Interop.dll"
 
 
 def package_path(root: Path, parts) -> Optional[Path]:
@@ -121,9 +122,22 @@ def unpack_tools(data: bytes, destination: Path) -> dict:
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             manifest = json.loads(archive.read("tools.json"))
-            names = manifest["generator"] + manifest["runtime"] + ["LICENSE"]
+            schema = manifest["schema"]
+            interop_sources = manifest.get("interop", [])
+            if schema == 2 and not interop_sources:
+                raise ValueError("tool manifest is missing its shared interop contract")
+            if schema == 1 and interop_sources:
+                raise ValueError(
+                    "legacy tool manifest cannot declare an interop contract"
+                )
+            names = (
+                manifest["generator"]
+                + manifest["runtime"]
+                + interop_sources
+                + ["LICENSE"]
+            )
             if (  # pylint: disable=too-many-boolean-expressions
-                manifest["schema"] != 1
+                schema not in (1, 2)
                 or len(names) != len(set(names))
                 or not manifest["generator"]
                 or not manifest["runtime"]
@@ -163,6 +177,34 @@ def mono_directory(wine: Path) -> Path:
     return candidates[0]
 
 
+def component_references(game: Path, build: Optional[Path]) -> List[Path]:
+    """Explicit build-time projections; never overwrite a package's DLL to stage them."""
+    if build is None:
+        return []
+    directory = build / "projection-references"
+    if not directory.is_dir():
+        return []
+    references = []
+    names = set()
+    for source in sorted(directory.iterdir()):
+        if (
+            source.suffix.casefold() != ".dll"
+            or source.name.casefold() == INTEROP_ASSEMBLY.casefold()
+        ):
+            continue
+        key = source.name.casefold()
+        if key in names:
+            raise InstallError(f"Ambiguous projection reference: {source.name}")
+        names.add(key)
+        existing = package_path(game.resolve(), (source.name,))
+        if existing is not None and existing.read_bytes() != source.read_bytes():
+            raise InstallError(
+                f"Projection reference conflicts with package DLL: {source.name}"
+            )
+        references.append(source)
+    return references
+
+
 def generate_projections(
     metadata, output, wine, tag, build
 ):  # pylint: disable=too-many-locals
@@ -171,6 +213,11 @@ def generate_projections(
         raise InstallError(
             "Install Wine Mono or set WINE before generating component projections."
         )
+    external = component_references(output.parent, build)
+    if {p.stem.casefold() for p in external} & {p.stem.casefold() for p in metadata}:
+        raise InstallError(
+            "A projection reference duplicates a component being generated."
+        )
     mono = mono_directory(wine)
     cecils = list((mono / "gac/Mono.Cecil").glob("0.11.*__*/Mono.Cecil.dll"))
     if len(cecils) != 1:
@@ -178,6 +225,10 @@ def generate_projections(
     with tempfile.TemporaryDirectory(prefix="appx-component-tools-") as temporary:
         work = Path(temporary)
         manifest = unpack_tools(tool_archive(tag, build), work)
+        if external and not manifest.get("interop"):
+            raise InstallError(
+                "These component projection tools do not support external references."
+            )
         shutil.copyfile(cecils[0], work / "Mono.Cecil.dll")
         env = dict(os.environ, WINEDEBUG="-all", MVK_CONFIG_LOG_LEVEL="0")
         env.setdefault("WINEPREFIX", str(work / "wine-prefix"))
@@ -258,16 +309,35 @@ def generate_projections(
             [work / n for n in manifest["generator"]],
             ["/r:" + windows(work / "Mono.Cecil.dll")],
         )
+        reference_flags = []
+        generator_flags = []
+        extras = set()
+        if external:
+            bridge = output / INTEROP_ASSEMBLY
+            compile_file(
+                bridge,
+                [work / name for name in manifest["interop"]],
+                ["/target:library"],
+            )
+            reference_flags = ["/define:APPX_PORTABLE_INTEROP", "/r:" + windows(bridge)]
+            for reference in external:
+                generator_flags += ["--reference", windows(reference)]
+                reference_flags += ["/r:" + windows(reference)]
+            extras = {p.name for p in external} | {INTEROP_ASSEMBLY}
         for source in metadata:
             generated = work / (source.stem + ".generated.cs")
             run(
                 [windows(generator), "--component", windows(source), windows(generated)]
+                + generator_flags
             )
             compile_file(
                 output / (source.stem + ".dll"),
                 [work / n for n in manifest["runtime"]] + [generated],
-                ["/target:library"],
+                ["/target:library"] + reference_flags,
             )
+        for reference in external:
+            shutil.copyfile(reference, output / reference.name)
+        return extras
 
 
 def install_component_projections(
@@ -287,8 +357,8 @@ def install_component_projections(
         )
     with tempfile.TemporaryDirectory(prefix="appx-projections-", dir=game) as temporary:
         staged = Path(temporary)
-        generate_projections(metadata, staged, wine, tag, build)
-        expected = {source.stem + ".dll" for source in metadata}
+        extras = generate_projections(metadata, staged, wine, tag, build)
+        expected = {source.stem + ".dll" for source in metadata} | (extras or set())
         if {p.name for p in staged.iterdir()} != expected:
             raise InstallError(
                 "Component projection tool did not produce the expected assemblies."

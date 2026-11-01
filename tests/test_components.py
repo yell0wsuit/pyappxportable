@@ -1,5 +1,6 @@
 """Package-native projections keep the original implementation DLLs intact."""
 
+import hashlib
 import io
 import json
 import tempfile
@@ -168,6 +169,84 @@ class ComponentTests(unittest.TestCase):
         with self.assertRaises(InstallError):
             components.unpack_tools(data.getvalue(), self.game)
         self.assertFalse((self.game.parent / "escaped.cs").exists())
+
+    def bundle(self, schema):
+        files = {
+            "generator.cs": b"generator",
+            "runtime.cs": b"runtime",
+            "LICENSE": b"license",
+        }
+        manifest = {
+            "schema": schema,
+            "generator": ["generator.cs"],
+            "runtime": ["runtime.cs"],
+        }
+        if schema == 2:
+            manifest["interop"] = ["interop.cs"]
+            files["interop.cs"] = b"shared contract"
+        manifest["sha256"] = {
+            name: hashlib.sha256(data).hexdigest() for name, data in files.items()
+        }
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w") as archive:
+            for name, data in files.items():
+                archive.writestr(name, data)
+            archive.writestr("tools.json", json.dumps(manifest))
+        return stream.getvalue()
+
+    def test_reads_legacy_tool_bundle(self):
+        manifest = components.unpack_tools(self.bundle(1), self.game)
+        self.assertEqual(manifest["schema"], 1)
+        self.assertFalse((self.game / "interop.cs").exists())
+
+    def test_reads_shared_contract_from_new_bundle(self):
+        manifest = components.unpack_tools(self.bundle(2), self.game)
+        self.assertEqual(manifest["interop"], ["interop.cs"])
+        self.assertEqual((self.game / "interop.cs").read_bytes(), b"shared contract")
+
+    def test_collects_explicit_references_without_shared_contract_binary(self):
+        build = self.game.parent / "build"
+        reference = build / "projection-references/Example.External.dll"
+        reference.parent.mkdir(parents=True)
+        reference.write_bytes(b"projection")
+        (reference.parent / "AppxPortable.WinRT.Interop.dll").write_bytes(b"contract")
+        self.assertEqual(components.component_references(self.game, build), [reference])
+
+    def test_reference_conflicting_with_package_dll_is_rejected(self):
+        build = self.game.parent / "build"
+        reference = build / "projection-references/Example.dll"
+        reference.parent.mkdir(parents=True)
+        reference.write_bytes(b"projection")
+        original = self.component()
+        with self.assertRaisesRegex(InstallError, "conflicts with package"):
+            components.component_references(self.game, build)
+        self.assertEqual(original.read_bytes(), b"native unchanged")
+
+    def test_success_can_stage_shared_contract_and_explicit_reference(self):
+        native = self.component()
+        self.manifest(["Example.dll"])
+
+        def generate(_metadata, output, _wine, _tag, _build):
+            for name in (
+                "Example.dll",
+                "Example.External.dll",
+                "AppxPortable.WinRT.Interop.dll",
+            ):
+                (output / name).write_bytes(b"generated")
+            return {"Example.External.dll", "AppxPortable.WinRT.Interop.dll"}
+
+        with mock.patch.object(
+            components,
+            "discover_components",
+            return_value=[native.with_suffix(".winmd")],
+        ), mock.patch.object(components, "generate_projections", side_effect=generate):
+            components.install_component_projections(
+                self.game, Path("/wine"), build=Path("/build")
+            )
+        self.assertTrue(
+            (self.game / "appx-projections/AppxPortable.WinRT.Interop.dll").is_file()
+        )
+        self.assertEqual(native.read_bytes(), b"native unchanged")
 
 
 if __name__ == "__main__":

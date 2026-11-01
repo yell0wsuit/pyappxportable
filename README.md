@@ -76,8 +76,13 @@ reference set, and Mono.Cecil 0.11. Generated assemblies live in
 `appx-projections/`; the original native component DLLs remain in place.
 
 This currently supports default activation, scalar/string methods, input byte
-arrays and custom callbacks. Unsupported signatures, including external Windows
-types, fail with a named diagnostic. Windows installations keep the CLR's native
+arrays and custom callbacks. Prepared external class/enum projections are read from the local build
+folder's `projection-references/` directory. They must be generated with Appx
+Portable's `--interop` mode; the installer compiles the shared handle contract and
+stages those dependencies with the components. Reference DLL filenames and
+assembly identities must match. References conflicting with package DLLs are
+refused. External interfaces/structs and other unsupported signatures fail with
+a named diagnostic. SDK-based reference generation remains a build step. Windows installations keep the CLR's native
 WinRT projection path. Neither SDK metadata nor compiler/Cecil tools are copied
 to the game directory.
 
