@@ -53,6 +53,17 @@ Upgrade the installer with `python -m pip install --upgrade pyappxportable`. Run
 
 The CLI checks PyPI in the background at most once a day and prints an upgrade command when a newer compatible stable release is available. Checks never install updates or delay startup; offline failures stay silent. Use `--no-update-check` or set `PYAPPXPORTABLE_NO_UPDATE_CHECK=1` to disable them. `--help`, `--version`, and Python API calls do not check for updates. Use `pyappxportable --version` to show the installed package version.
 
+For managed x86 games on Apple Silicon, runtime releases that include
+`appx-portable-wine-clr-macos.tar.xz` use a patched Wine runtime. The installer
+checks the release asset SHA-256 and the bundled CPU module, then caches it in
+`~/Library/Application Support/appx-portable/wine/<archive-sha256>/`. The launcher
+selects that Wine executable and a game-local `.wine-prefix/<runtime-identity>`.
+Set `WINE` to select another engine or `WINEPREFIX` to use an existing prefix;
+the pinned engine refuses a prefix that retains a different WoW64 CPU module.
+Older releases without this asset and local `--build` installs without a
+`--release` tag keep the usual Wine lookup. This patch fixes CLR startup only;
+managed games still need WinRT projection and XAML support.
+
 On macOS, the installer can set up Wine Devel, Rosetta 2, and GStreamer. Rosetta and GStreamer require administrator authorization; `--yes` prints instructions for those steps. See the [installer guide](https://github.com/yell0wsuit/appx-portable/blob/main/docs/installer.md) and [game compatibility](https://github.com/yell0wsuit/appx-portable/blob/main/docs/compatibility.md).
 
 ## Python API

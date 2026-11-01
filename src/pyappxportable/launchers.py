@@ -1,7 +1,9 @@
 """Launchers helpers for portable Windows Store games."""
 
+import hashlib
 import shlex
 from pathlib import Path, PureWindowsPath
+from typing import Optional
 
 from pyappxportable.pe import pe_imports
 
@@ -30,7 +32,7 @@ export MVK_CONFIG_LOG_LEVEL=${{MVK_CONFIG_LOG_LEVEL:-0}}
 graphics=
 [[ -f d3d11.dll && -f dxgi.dll && -f wined3d.dll ]] && graphics=';d3d11,dxgi,wined3d=n'
 {renderer}export WINEDLLOVERRIDES="d3dcompiler_47,xaudio2_8,xaudio2_9,dwrite=n,b;msvcr110,msvcp110,vccorlib110,msvcr120_app,msvcp120_app,vccorlib120_app,vcruntime140_app,msvcp140_app,vccorlib140_app=n$graphics${{WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}}"
-wine=${{WINE:-$(command -v wine || echo "$HOME/Applications/Wine Devel.app/Contents/Resources/wine/bin/wine")}}
+{wine_setup}
 [[ -x "$wine" ]] || {{ echo 'Install Wine, or set WINE to your Wine executable.' >&2; exit 1; }}
 {media}# A crash otherwise opens Wine's crash dialog, which keeps the process alive
 # until closed and stalls the relaunch below; print the backtrace and exit.
@@ -122,8 +124,33 @@ def launch_executable(executable: str, managed: bool, native_host: bool = False)
     return "appx-host.exe" if managed else executable
 
 
-def write_launcher(
-    game: Path, executable: str, windows: bool, macos: bool = False, media: bool = False
+def managed_wine_setup(wine_runtime: Path) -> str:
+    """Keep a managed prefix tied to the engine component it was tested with."""
+    wine = shlex.quote(str(wine_runtime))
+    identity = hashlib.sha256(str(wine_runtime).encode()).hexdigest()[:16]
+    cpu = shlex.quote(
+        str(wine_runtime.parent.parent / "lib/wine/x86_64-windows/wow64cpu.dll")
+    )
+    return f"""wine=${{WINE:-{wine}}}
+if [[ -z ${{WINEPREFIX:-}} ]]; then
+  mkdir -p "$PWD/.wine-prefix"
+fi
+export WINEPREFIX=${{WINEPREFIX:-"$PWD/.wine-prefix/{identity}"}}
+expected_cpu={cpu}
+retained_cpu="$WINEPREFIX/drive_c/windows/system32/wow64cpu.dll"
+if [[ "$wine" == {wine} && -f "$retained_cpu" ]] && ! cmp -s "$expected_cpu" "$retained_cpu"; then
+  echo 'This prefix retains a different WoW64 component. Use a new WINEPREFIX or unset it for the game runtime prefix.' >&2
+  exit 1
+fi"""
+
+
+def write_launcher(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    game: Path,
+    executable: str,
+    windows: bool,
+    macos: bool = False,
+    media: bool = False,
+    wine_runtime: Optional[Path] = None,
 ) -> Path:
     """Write 00_click2startme.bat (CRLF), or the executable Wine launcher into game.
 
@@ -141,6 +168,14 @@ def write_launcher(
             exe=shlex.quote(executable),
             renderer=MACOS_RENDERER if macos else "",
             media=MACOS_GSTREAMER if macos and media else "",
+            wine_setup=(
+                managed_wine_setup(wine_runtime)
+                if wine_runtime is not None
+                else (
+                    'wine=${WINE:-$(command -v wine || echo "$HOME/Applications/'
+                    'Wine Devel.app/Contents/Resources/wine/bin/wine")}'
+                )
+            ),
         )
         path.write_bytes(text.encode())
         path.chmod(0o755)

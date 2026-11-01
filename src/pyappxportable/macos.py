@@ -1,6 +1,8 @@
 """Macos helpers for portable Windows Store games."""
 
+import hashlib
 import io
+import json
 import os
 import platform
 import re
@@ -9,8 +11,9 @@ import subprocess
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
+from pyappxportable.constants import REPOSITORY
 from pyappxportable.downloads import download_verified, fetch
 from pyappxportable.errors import InstallError
 
@@ -23,6 +26,10 @@ WINE_DEVEL = (
     "aa0ea4c82e636ae7bca2076387cb0a5affa26509ad13f119ecd0d62bd7ba6f82",
 )
 WINE_DEVEL_APP = Path.home() / "Applications" / "Wine Devel.app"
+WINE_CLR_ROOT = (
+    Path.home() / "Library" / "Application Support" / "appx-portable" / "wine"
+)
+WINE_CLR_ASSET = "appx-portable-wine-clr-macos.tar.xz"
 # The GStreamer runtime Wine's Media Foundation loads for audio and video.
 # Wine 11.18 is built against 1.28; later 1.x releases keep its ABI.
 GSTREAMER_RELEASES = "https://gstreamer.freedesktop.org/data/pkg/osx/"
@@ -95,6 +102,64 @@ def install_wine_devel() -> None:
     print(f"Installed {WINE_DEVEL_APP}")
 
 
+def check_managed_wine(folder: Path) -> Path:
+    """Validate the engine component before reusing an immutable runtime cache."""
+    try:
+        manifest = json.loads((folder / "wine-clr.json").read_text())
+        runtime = folder / "Wine Devel.app" / "Contents" / "Resources" / "wine"
+        cpu = runtime / "lib" / "wine" / "x86_64-windows" / "wow64cpu.dll"
+        wine = runtime / "bin" / "wine"
+        if (
+            manifest["schema"] != 1
+            or manifest["wine_version"] != "11.18"
+            or hashlib.sha256(cpu.read_bytes()).hexdigest() != manifest["cpu_sha256"]
+            or not os.access(wine, os.X_OK)
+        ):
+            raise ValueError("runtime contents do not match the manifest")
+        return wine
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise InstallError(
+            f"Invalid managed Wine runtime in {folder}: {error}"
+        ) from error
+
+
+def install_managed_wine(tag: str) -> Optional[Path]:
+    """Install this release's patched engine without replacing an existing Wine app."""
+    try:
+        release = json.loads(
+            fetch(f"https://api.github.com/repos/{REPOSITORY}/releases/tags/{tag}")
+        )
+        asset = next(
+            (
+                item
+                for item in release.get("assets", [])
+                if item["name"] == WINE_CLR_ASSET
+            ),
+            None,
+        )
+        if asset is None:
+            return None
+        digest = asset.get("digest", "")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            raise ValueError("patched Wine asset has no SHA-256 digest")
+        sha256 = digest.split(":", 1)[1]
+        url = asset["browser_download_url"]
+    except (ValueError, KeyError, TypeError) as error:
+        raise InstallError(
+            f"Could not read managed Wine runtime for {tag}: {error}"
+        ) from error
+    destination = WINE_CLR_ROOT / sha256
+    if destination.exists():
+        return check_managed_wine(destination)
+    data = download_verified(url, sha256)
+    WINE_CLR_ROOT.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=WINE_CLR_ROOT) as temporary:
+        extract_tar_xz(data, Path(temporary))
+        check_managed_wine(Path(temporary))
+        os.replace(temporary, destination)
+    return check_managed_wine(destination)
+
+
 def latest_gstreamer() -> str:
     """The newest stable GStreamer 1.x for macOS; odd minor versions are development ones."""
     listing = fetch(GSTREAMER_RELEASES, "install it yourself").decode(
@@ -158,7 +223,9 @@ def install_rosetta() -> None:
         raise InstallError("Rosetta 2 was not installed.")
 
 
-def add_macos_dependencies(args, ask: Callable[[str], str]) -> None:
+def add_macos_dependencies(
+    args, ask: Callable[[str], str], wine_ready: bool = False
+) -> None:
     """Offer what Wine on macOS needs and lacks: Rosetta 2, Wine Devel and GStreamer.
 
     Wine Devel needs no administrator; --yes installs it. The others need sudo,
@@ -175,7 +242,7 @@ def add_macos_dependencies(args, ask: Callable[[str], str]) -> None:
             " (asks for your administrator password)? [Y/n]: "
         ):
             install_rosetta()
-    if not wine_installed():
+    if not wine_ready and not wine_installed():
         if args.yes or agreed(
             f"Wine is not installed. Download Wine Devel into {WINE_DEVEL_APP.parent}? [Y/n]: "
         ):

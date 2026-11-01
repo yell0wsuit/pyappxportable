@@ -1,5 +1,7 @@
 """Installer helpers for portable Windows Store games."""
 
+import os
+import platform
 import sys
 import tempfile
 from pathlib import Path
@@ -23,7 +25,7 @@ from pyappxportable.launchers import (
     plays_media,
     write_launcher,
 )
-from pyappxportable.macos import add_macos_dependencies
+from pyappxportable.macos import add_macos_dependencies, install_managed_wine
 from pyappxportable.manifest import Manifest
 from pyappxportable.options import InstallOptions
 from pyappxportable.patches import KNOWN_PATCHES, apply_known_patch
@@ -164,7 +166,9 @@ def choose_store(args, ask: Callable[[str], str], game: Path) -> Optional[str]:
             return STORE_ANSWERS.get(answer)
 
 
-def install_game(args: InstallOptions, ask: Callable[[str], str] = input) -> int:
+def install_game(  # pylint: disable=too-many-locals
+    args: InstallOptions, ask: Callable[[str], str] = input
+) -> int:
     """Install the game the arguments and answers describe."""
     source, destination, manifest = choose_folders(args, ask)
     print(f"Installing {manifest.name} {manifest.version} into {destination}")
@@ -194,6 +198,16 @@ def install_game(args: InstallOptions, ask: Callable[[str], str] = input) -> int
     if not managed and not native_host and (args.desktop_copy or needs_desktop_copy()):
         launch = make_desktop_copy(destination, manifest.executable)
     write_settings(destination, choose_store(args, ask, destination))
+    managed_wine = None
+    if (  # pylint: disable=too-many-boolean-expressions
+        managed
+        and architecture == "x86"
+        and sys.platform == "darwin"
+        and platform.machine() == "arm64"
+        and not os.environ.get("WINE")
+        and tag
+    ):
+        managed_wine = install_managed_wine(tag)
     launcher = args.launcher
     if launcher is None:
         answer = "" if args.yes else ask(f"Create the {LAUNCHER} launcher? [Y/n]: ")
@@ -206,12 +220,19 @@ def install_game(args: InstallOptions, ask: Callable[[str], str] = input) -> int
                 windows=sys.platform == "win32",
                 macos=sys.platform == "darwin",
                 media=plays_media(destination, executable),
+                wine_runtime=managed_wine,
             )
         )
     if sys.platform == "darwin":
-        add_macos_dependencies(args, ask)
+        add_macos_dependencies(args, ask, wine_ready=managed_wine is not None)
     if managed and sys.platform != "win32":
-        print(f"Warning: {MANAGED_UNDER_WINE}")
+        message = (
+            "managed (.NET) games still need the WinRT projection and XAML engine;"
+            " the patched Wine runtime fixes CLR startup only."
+            if managed_wine is not None
+            else MANAGED_UNDER_WINE
+        )
+        print(f"Warning: {message}")
     warning = path_warning(
         destination, [str(p) for p in destination.rglob("*") if p.is_file()]
     )
