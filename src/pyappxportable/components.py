@@ -24,6 +24,31 @@ TOOLS_ASSET = "appx-portable-winrt-tools.zip"
 INTEROP_ASSEMBLY = "AppxPortable.WinRT.Interop.dll"
 
 
+class ComponentToolFailure(InstallError):
+    """The projection tool rejected an input; reason is its last diagnostic line."""
+
+    def __init__(self, output: str, code: int):
+        super().__init__("Component projection failed: " + output[-6000:])
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        self.reason = lines[-1] if lines else f"exit {code}"
+
+
+def project_each(metadata, output, project) -> set:
+    """Project each component; skip, by name, one the tools cannot express."""
+    skipped = set()
+    for source in metadata:
+        try:
+            project(source)
+        except ComponentToolFailure as error:
+            (output / (source.stem + ".dll")).unlink(missing_ok=True)
+            skipped.add(source.stem + ".dll")
+            print(
+                f"Warning: skipped the {source.stem} component projection; "
+                f"the game fails only if it uses {source.stem}: {error.reason}"
+            )
+    return skipped
+
+
 def package_path(root: Path, parts) -> Optional[Path]:
     """Resolve Windows package spelling on a case-sensitive host, without ambiguity."""
     path = root
@@ -267,9 +292,7 @@ def generate_projections(
                     f"Component projection command failed: {error}"
                 ) from error
             if result.returncode:
-                raise InstallError(
-                    "Component projection failed: " + (text + errors)[-6000:]
-                )
+                raise ComponentToolFailure(text + errors, result.returncode)
             return text.strip()
 
         def windows(path):
@@ -324,7 +347,8 @@ def generate_projections(
                 generator_flags += ["--reference", windows(reference)]
                 reference_flags += ["/r:" + windows(reference)]
             extras = {p.name for p in external} | {INTEROP_ASSEMBLY}
-        for source in metadata:
+
+        def project(source):
             generated = work / (source.stem + ".generated.cs")
             run(
                 [windows(generator), "--component", windows(source), windows(generated)]
@@ -335,9 +359,11 @@ def generate_projections(
                 [work / n for n in manifest["runtime"]] + [generated],
                 ["/target:library"] + reference_flags,
             )
+
+        skipped = project_each(metadata, output, project)
         for reference in external:
             shutil.copyfile(reference, output / reference.name)
-        return extras
+        return extras, skipped
 
 
 def install_component_projections(
@@ -357,8 +383,8 @@ def install_component_projections(
         )
     with tempfile.TemporaryDirectory(prefix="appx-projections-", dir=game) as temporary:
         staged = Path(temporary)
-        extras = generate_projections(metadata, staged, wine, tag, build)
-        expected = {source.stem + ".dll" for source in metadata} | (extras or set())
+        extras, skipped = generate_projections(metadata, staged, wine, tag, build)
+        expected = ({source.stem + ".dll" for source in metadata} - skipped) | extras
         if {p.name for p in staged.iterdir()} != expected:
             raise InstallError(
                 "Component projection tool did not produce the expected assemblies."

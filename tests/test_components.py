@@ -119,6 +119,7 @@ class ComponentTests(unittest.TestCase):
 
         def generate(_metadata, output, _wine, _tag, _build):
             (output / "Example.dll").write_bytes(b"managed projection")
+            return set(), set()
 
         with mock.patch.object(
             components,
@@ -134,6 +135,58 @@ class ComponentTests(unittest.TestCase):
         )
         self.assertEqual(native.read_bytes(), b"native unchanged")
         self.assertFalse((self.game / "Mono.Cecil.dll").exists())
+
+    def test_unprojectable_component_is_skipped_with_a_named_warning(self):
+        staged = Path(self.game) / "staged"
+        staged.mkdir()
+        sources = [Path("/game/Example.winmd"), Path("/game/Microsoft.Xbox.winmd")]
+
+        def project(source):
+            (staged / (source.stem + ".dll")).write_bytes(b"partial")
+            if source.stem == "Microsoft.Xbox":
+                raise components.ComponentToolFailure(
+                    "Generating\nUnsupported factory constructor: ServiceClient(String)\n",
+                    1,
+                )
+
+        with mock.patch("builtins.print") as printed:
+            skipped = components.project_each(sources, staged, project)
+        self.assertEqual(skipped, {"Microsoft.Xbox.dll"})
+        self.assertEqual([p.name for p in staged.iterdir()], ["Example.dll"])
+        message = printed.call_args[0][0]
+        self.assertIn("Microsoft.Xbox", message)
+        self.assertIn("Unsupported factory constructor: ServiceClient(String)", message)
+
+    def test_tool_command_failure_is_not_skipped(self):
+        def project(_source):
+            raise InstallError("Component projection command failed: timed out")
+
+        with self.assertRaisesRegex(InstallError, "timed out"):
+            components.project_each(
+                [Path("/game/Example.winmd")], Path(self.game), project
+            )
+
+    def test_skipped_component_is_not_expected_or_published(self):
+        native = self.component()
+        self.manifest(["Example.dll", "Microsoft.Xbox.dll"])
+        xbox = self.component("Microsoft.Xbox.dll")
+
+        def generate(_metadata, output, _wine, _tag, _build):
+            (output / "Example.dll").write_bytes(b"managed projection")
+            return set(), {"Microsoft.Xbox.dll"}
+
+        with mock.patch.object(
+            components,
+            "discover_components",
+            return_value=[native.with_suffix(".winmd"), xbox.with_suffix(".winmd")],
+        ), mock.patch.object(components, "generate_projections", side_effect=generate):
+            components.install_component_projections(
+                self.game, Path("/wine"), build=Path("/build")
+            )
+        self.assertEqual(
+            sorted(p.name for p in (self.game / "appx-projections").iterdir()),
+            ["Example.dll"],
+        )
 
     def test_without_components_needs_no_tools_or_wine(self):
         self.manifest([])
@@ -233,7 +286,7 @@ class ComponentTests(unittest.TestCase):
                 "AppxPortable.WinRT.Interop.dll",
             ):
                 (output / name).write_bytes(b"generated")
-            return {"Example.External.dll", "AppxPortable.WinRT.Interop.dll"}
+            return {"Example.External.dll", "AppxPortable.WinRT.Interop.dll"}, set()
 
         with mock.patch.object(
             components,
