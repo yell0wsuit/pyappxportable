@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
-from pyappxportable.components import install_component_projections
+from pyappxportable.components import install_managed_runtime
 from pyappxportable.dependencies import (
     VCLIBS_DOWNLOADS,
     add_native_frameworks,
@@ -220,7 +220,7 @@ def install_game(  # pylint: disable=too-many-locals,too-many-branches
         selected_wine = os.environ.get("WINE") or managed_wine or shutil.which("wine")
         if selected_wine is None and sys.platform == "darwin":
             selected_wine = WINE_DEVEL_APP / "Contents/Resources/wine/bin/wine"
-        install_component_projections(
+        install_managed_runtime(
             destination,
             Path(selected_wine) if selected_wine else None,
             tag=tag,

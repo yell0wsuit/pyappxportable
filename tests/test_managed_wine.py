@@ -230,7 +230,7 @@ class ManagedWineInstallTests(unittest.TestCase):
         manifest = Manifest("Game", "1.0.0.0", architecture, "Game.exe", [])
         stubs = {
             "choose_folders": mock.DEFAULT,
-            "install_component_projections": mock.DEFAULT,
+            "install_managed_runtime": mock.DEFAULT,
             "add_missing_vclibs": mock.DEFAULT,
             "add_native_frameworks": mock.DEFAULT,
             "write_settings": mock.DEFAULT,
@@ -269,7 +269,7 @@ class ManagedWineInstallTests(unittest.TestCase):
             patched["plays_media"].return_value = False
             patched["path_warning"].return_value = None
             patched["read_store"].return_value = "none"
-            self.projections = patched["install_component_projections"]
+            self.projections = patched["install_managed_runtime"]
             code = installer.install_game(InstallOptions(no_patch=True, store="0"))
         return code, runtime, patched["add_macos_dependencies"], output.getvalue()
 

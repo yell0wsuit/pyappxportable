@@ -90,6 +90,19 @@ class ComponentTests(unittest.TestCase):
         with self.assertRaisesRegex(InstallError, "ambiguous"):
             self.discover()
 
+    def install(self, schema=3, generate=None, components_found=()):
+        with mock.patch.object(
+            components, "tool_archive", return_value=self.bundle(schema)
+        ), mock.patch.object(
+            components, "discover_components", return_value=list(components_found)
+        ), mock.patch.object(
+            components, "generate_projections", side_effect=generate
+        ) as generator:
+            components.install_managed_runtime(
+                self.game, Path("/wine"), build=Path("/build")
+            )
+        return generator
+
     def test_generation_failure_preserves_existing_projection_and_native(self):
         native = self.component()
         self.manifest(["Example.dll"])
@@ -97,44 +110,89 @@ class ComponentTests(unittest.TestCase):
         projected.mkdir()
         existing = projected / "Example.dll"
         existing.write_bytes(b"old projection")
-        with mock.patch.object(
-            components,
-            "discover_components",
-            return_value=[native.with_suffix(".winmd")],
-        ), mock.patch.object(
-            components,
-            "generate_projections",
-            side_effect=InstallError("unsupported parameter"),
-        ):
-            with self.assertRaisesRegex(InstallError, "unsupported parameter"):
-                components.install_component_projections(
-                    self.game, Path("/wine"), build=Path("/build")
-                )
+
+        def fail(*_args):
+            raise InstallError("unsupported parameter")
+
+        with self.assertRaisesRegex(InstallError, "unsupported parameter"):
+            self.install(generate=fail, components_found=[native.with_suffix(".winmd")])
         self.assertEqual(existing.read_bytes(), b"old projection")
         self.assertEqual(native.read_bytes(), b"native unchanged")
+        self.assertFalse((self.game / "Windows.dll").exists())
 
-    def test_success_publishes_only_generated_files_in_separate_directory(self):
+    def test_success_publishes_prebuilt_and_generated_assemblies(self):
         native = self.component()
         self.manifest(["Example.dll"])
 
-        def generate(_metadata, output, _wine, _tag, _build):
+        def generate(_metadata, output, _wine, work, _manifest):
+            self.assertEqual((work / "Windows.dll").read_bytes(), b"windows")
             (output / "Example.dll").write_bytes(b"managed projection")
-            return set(), set()
+            return set()
 
-        with mock.patch.object(
-            components,
-            "discover_components",
-            return_value=[native.with_suffix(".winmd")],
-        ), mock.patch.object(components, "generate_projections", side_effect=generate):
-            components.install_component_projections(
-                self.game, Path("/wine"), build=Path("/build")
-            )
+        self.install(generate=generate, components_found=[native.with_suffix(".winmd")])
+        projected = self.game / "appx-projections"
         self.assertEqual(
-            (self.game / "appx-projections/Example.dll").read_bytes(),
-            b"managed projection",
+            (projected / "Example.dll").read_bytes(), b"managed projection"
+        )
+        self.assertEqual(
+            (projected / "AppxPortable.WinRT.Interop.dll").read_bytes(), b"interop"
+        )
+        self.assertEqual((self.game / "Windows.dll").read_bytes(), b"windows")
+        self.assertEqual(
+            (self.game / "System.Runtime.WindowsRuntime.dll").read_bytes(), b"bridge"
         )
         self.assertEqual(native.read_bytes(), b"native unchanged")
         self.assertFalse((self.game / "Mono.Cecil.dll").exists())
+
+    def test_managed_game_without_components_still_gets_windows(self):
+        self.manifest([])
+        generator = self.install()
+        generator.assert_not_called()
+        self.assertEqual((self.game / "Windows.dll").read_bytes(), b"windows")
+        self.assertEqual(
+            (self.game / "System.Runtime.WindowsRuntime.dll").read_bytes(), b"bridge"
+        )
+
+    def test_tools_without_prebuilt_assemblies_are_too_old(self):
+        self.manifest([])
+        with self.assertRaisesRegex(InstallError, "too old"):
+            self.install(schema=2)
+        self.assertFalse((self.game / "Windows.dll").exists())
+
+    def test_package_file_with_a_staged_name_is_not_overwritten(self):
+        self.manifest([])
+        shipped = self.game / "Windows.dll"
+        shipped.write_bytes(b"package's own")
+        with self.assertRaisesRegex(InstallError, "conflicts with package"):
+            self.install()
+        self.assertEqual(shipped.read_bytes(), b"package's own")
+
+    def test_reinstall_replaces_assemblies_the_installer_staged(self):
+        self.manifest([])
+        self.install()
+        (self.game / "Windows.dll").write_bytes(b"windows")
+        with mock.patch.object(
+            self, "prebuilt", {**self.prebuilt, "Windows.dll": b"newer windows"}
+        ):
+            self.install()
+        self.assertEqual((self.game / "Windows.dll").read_bytes(), b"newer windows")
+
+    def test_components_project_against_the_shipped_windows(self):
+        work = Path("/work")
+        generator, compiler = components.component_commands(
+            lambda p: "W:" + p.name,
+            work,
+            Path("/game/Example.winmd"),
+            {"runtime": ["runtime.cs"]},
+        )
+        self.assertEqual(generator[:2], ["W:generator.exe", "--component"])
+        self.assertEqual(generator[-2:], ["--reference", "W:Windows.dll"])
+        for flag in (
+            "/define:APPX_PORTABLE_INTEROP",
+            "/r:W:AppxPortable.WinRT.Interop.dll",
+            "/r:W:Windows.dll",
+        ):
+            self.assertIn(flag, compiler)
 
     def test_unprojectable_component_is_skipped_with_a_named_warning(self):
         staged = Path(self.game) / "staged"
@@ -168,31 +226,21 @@ class ComponentTests(unittest.TestCase):
 
     def test_skipped_component_is_not_expected_or_published(self):
         native = self.component()
-        self.manifest(["Example.dll", "Microsoft.Xbox.dll"])
         xbox = self.component("Microsoft.Xbox.dll")
+        self.manifest(["Example.dll", "Microsoft.Xbox.dll"])
 
-        def generate(_metadata, output, _wine, _tag, _build):
+        def generate(_metadata, output, _wine, _work, _manifest):
             (output / "Example.dll").write_bytes(b"managed projection")
-            return set(), {"Microsoft.Xbox.dll"}
+            return {"Microsoft.Xbox.dll"}
 
-        with mock.patch.object(
-            components,
-            "discover_components",
-            return_value=[native.with_suffix(".winmd"), xbox.with_suffix(".winmd")],
-        ), mock.patch.object(components, "generate_projections", side_effect=generate):
-            components.install_component_projections(
-                self.game, Path("/wine"), build=Path("/build")
-            )
+        self.install(
+            generate=generate,
+            components_found=[native.with_suffix(".winmd"), xbox.with_suffix(".winmd")],
+        )
         self.assertEqual(
             sorted(p.name for p in (self.game / "appx-projections").iterdir()),
-            ["Example.dll"],
+            ["AppxPortable.WinRT.Interop.dll", "Example.dll", components.STAGED_RECORD],
         )
-
-    def test_without_components_needs_no_tools_or_wine(self):
-        self.manifest([])
-        with mock.patch.object(components, "generate_projections") as generate:
-            components.install_component_projections(self.game, None)
-        generate.assert_not_called()
 
     def test_bad_release_tool_digest_is_refused(self):
         release = {
@@ -223,7 +271,13 @@ class ComponentTests(unittest.TestCase):
             components.unpack_tools(data.getvalue(), self.game)
         self.assertFalse((self.game.parent / "escaped.cs").exists())
 
-    def bundle(self, schema):
+    prebuilt = {
+        "AppxPortable.WinRT.Interop.dll": b"interop",
+        "System.Runtime.WindowsRuntime.dll": b"bridge",
+        "Windows.dll": b"windows",
+    }
+
+    def bundle(self, schema, tamper=None):
         files = {
             "generator.cs": b"generator",
             "runtime.cs": b"runtime",
@@ -234,12 +288,17 @@ class ComponentTests(unittest.TestCase):
             "generator": ["generator.cs"],
             "runtime": ["runtime.cs"],
         }
-        if schema == 2:
+        if schema >= 2:
             manifest["interop"] = ["interop.cs"]
             files["interop.cs"] = b"shared contract"
+        if schema >= 3:
+            manifest["prebuilt"] = sorted(self.prebuilt)
+            files.update(self.prebuilt)
         manifest["sha256"] = {
             name: hashlib.sha256(data).hexdigest() for name, data in files.items()
         }
+        if tamper:
+            files[tamper] = b"tampered"
         stream = io.BytesIO()
         with zipfile.ZipFile(stream, "w") as archive:
             for name, data in files.items():
@@ -257,49 +316,15 @@ class ComponentTests(unittest.TestCase):
         self.assertEqual(manifest["interop"], ["interop.cs"])
         self.assertEqual((self.game / "interop.cs").read_bytes(), b"shared contract")
 
-    def test_collects_explicit_references_without_shared_contract_binary(self):
-        build = self.game.parent / "build"
-        reference = build / "projection-references/Example.External.dll"
-        reference.parent.mkdir(parents=True)
-        reference.write_bytes(b"projection")
-        (reference.parent / "AppxPortable.WinRT.Interop.dll").write_bytes(b"contract")
-        self.assertEqual(components.component_references(self.game, build), [reference])
+    def test_reads_prebuilt_assemblies_from_new_bundle(self):
+        manifest = components.unpack_tools(self.bundle(3), self.game)
+        self.assertEqual(manifest["prebuilt"], sorted(self.prebuilt))
+        self.assertEqual((self.game / "Windows.dll").read_bytes(), b"windows")
 
-    def test_reference_conflicting_with_package_dll_is_rejected(self):
-        build = self.game.parent / "build"
-        reference = build / "projection-references/Example.dll"
-        reference.parent.mkdir(parents=True)
-        reference.write_bytes(b"projection")
-        original = self.component()
-        with self.assertRaisesRegex(InstallError, "conflicts with package"):
-            components.component_references(self.game, build)
-        self.assertEqual(original.read_bytes(), b"native unchanged")
-
-    def test_success_can_stage_shared_contract_and_explicit_reference(self):
-        native = self.component()
-        self.manifest(["Example.dll"])
-
-        def generate(_metadata, output, _wine, _tag, _build):
-            for name in (
-                "Example.dll",
-                "Example.External.dll",
-                "AppxPortable.WinRT.Interop.dll",
-            ):
-                (output / name).write_bytes(b"generated")
-            return {"Example.External.dll", "AppxPortable.WinRT.Interop.dll"}, set()
-
-        with mock.patch.object(
-            components,
-            "discover_components",
-            return_value=[native.with_suffix(".winmd")],
-        ), mock.patch.object(components, "generate_projections", side_effect=generate):
-            components.install_component_projections(
-                self.game, Path("/wine"), build=Path("/build")
-            )
-        self.assertTrue(
-            (self.game / "appx-projections/AppxPortable.WinRT.Interop.dll").is_file()
-        )
-        self.assertEqual(native.read_bytes(), b"native unchanged")
+    def test_tampered_prebuilt_assembly_is_refused(self):
+        with self.assertRaisesRegex(InstallError, "digest mismatch: Windows.dll"):
+            components.unpack_tools(self.bundle(3, tamper="Windows.dll"), self.game)
+        self.assertFalse((self.game / "Windows.dll").exists())
 
 
 if __name__ == "__main__":
